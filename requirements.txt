@@ -8,5 +8,5 @@ PyPDF2
 python-dotenv
 faiss-cpu
 google-generativeai
-ddgs
-vapi_python
+realtimetts
+realtimestt

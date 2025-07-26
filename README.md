@@ -4,10 +4,11 @@ This project demonstrates a simple Retrieval-Augmented Generation (RAG) system u
 
 ## Features
 
-- **Streamlit UI**: An interactive web interface to upload PDF documents and ask questions.
-- **LangChain**: Orchestrates the RAG pipeline, including document loading, text splitting, embedding, and conversational chain.
+- **Streamlit UI**: An interactive web interface to upload PDF documents and ask questions, now featuring both text and voice input, with improved streaming output for a smoother user experience.
+- **Voice Activity Detection (VAD)**: Integrates `webrtcvad` to automatically detect when a user stops speaking, enhancing the voice interaction experience.
+- **LangChain**: Orchestrates the RAG pipeline, including document loading, text splitting, embedding, and a modern conversational chain setup using `create_stuff_documents_chain` and `ChatPromptTemplate`.
 - **Google Gemini API**: Powers the embeddings and the conversational AI model.
-- **ChromaDB**: A lightweight and easy-to-set-up vector database for storing document embeddings.
+- **ChromaDB**: A lightweight and easy-to-set-up vector database for storing document embeddings, now using the `langchain-chroma` package for better integration and to resolve deprecation warnings.
 
 ## Setup and Installation
 
@@ -33,6 +34,7 @@ Install the required Python packages using `pip`:
 
 ```bash
 pip install -r requirements.txt
+pip install langchain-chroma
 ```
 
 ### 4. Set up your Google API Key
@@ -57,7 +59,8 @@ This will open the Streamlit application in your web browser. If it doesn't open
 
 1. **Upload PDF Documents**: On the sidebar, use the "Upload your PDF Documents" section to upload one or more PDF files. These documents will be used to populate the RAG system.
 2. **Process Documents**: Click the "Process Documents" button after uploading your PDFs. This will extract text, split it into chunks, create embeddings, and store them in ChromaDB.
-3. **Ask Questions**: Once the documents are processed, you can type your questions in the "Your Question:" input box. The RAG system will retrieve relevant information from your uploaded documents and generate an answer using the Gemini API.
+3. **Ask Questions (Text Input)**: Once the documents are processed, you can type your questions in the chat input box at the bottom of the screen. The RAG system will retrieve relevant information from your uploaded documents and generate an answer using the Gemini API.
+4. **Ask Questions (Voice Input)**: Alternatively, use the "🎤 Start/Stop Recording" button under the "Voice Input" section. Click to start speaking, and the system will automatically detect when you stop. Your speech will be transcribed and used as a question for the RAG system.
 
 ## Project Structure
 

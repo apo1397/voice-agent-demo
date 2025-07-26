@@ -4,6 +4,11 @@ import pathlib
 import textwrap
 from PIL import Image
 import logging
+import streamlit as st
+from RealtimeTTS import TextToAudioStream, SystemEngine
+from RealtimeSTT import AudioToTextRecorder
+import nltk
+nltk.data.path.append('./nltk_data')
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -12,11 +17,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.chains.question_answering import load_qa_chain
-from langchain.prompts import PromptTemplate
-from tools.web_search import web_search
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
+# from tools.web_search import web_search
 
 
 # For displaying Markdown in Streamlit (though not directly used in the final Streamlit UI, good for debugging/testing)
@@ -35,27 +40,35 @@ else:
     st.warning("Please enter your Google API Key!")
     logging.warning("Google API Key not set.")
 
+# Check for VAPI_API_KEY (re-adding this check as it was part of the previous integration)
+# VAPI_API_KEY = os.environ.get("VAPI_API_KEY")
+# if not VAPI_API_KEY:
+#     logging.warning("VAPI_API_KEY environment variable not set.")
+#     st.warning("VAPI_API_KEY environment variable not set. Vapi.ai features will not be available.")
+
 
 import tempfile
 
 # Function to extract text from PDF documents
-def get_pdf_text(pdf_docs):
-    logging.info("Starting PDF text extraction.")
+def get_document_text(uploaded_file):
+    logging.info(f"Starting text extraction for {uploaded_file.name}.")
     text = ""
-    for pdf in pdf_docs:
-        # Save the uploaded file to a temporary file
+    file_extension = os.path.splitext(uploaded_file.name)[1].lower()
+
+    if file_extension == ".pdf":
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-            tmp_file.write(pdf.read())
+            tmp_file.write(uploaded_file.read())
             tmp_file_path = tmp_file.name
-
-        # Initialize PyPDFLoader with the temporary file path
         pdf_reader = PyPDFLoader(tmp_file_path)
-        # Extract text from each Document and append as a single string
         documents = pdf_reader.load_and_split()
-        text += "\n".join([doc.page_content for doc in documents])
-        logging.info(f"Extracted text from {tmp_file.name}.")
+        text = "\n".join([doc.page_content for doc in documents])
+        os.unlink(tmp_file_path) # Clean up the temporary file
+    else:
+        logging.warning(f"Unsupported file type: {file_extension}")
+        st.warning(f"Unsupported file type: {file_extension}. Only PDF files are supported for now.")
+        return None
 
-    logging.info("Finished PDF text extraction.")
+    logging.info(f"Finished text extraction for {uploaded_file.name}.")
     return text
 
 # Function to split text into smaller, manageable chunks
@@ -72,44 +85,55 @@ def get_text_chunks(text):
     return chunks
 
 # Function to create a vector store from text chunks
-def get_vector_store(text_chunks):
-    logging.info("Starting vector store creation.")
-    # Initialize GoogleGenerativeAIEmbeddings for creating embeddings
+def get_vector_store(text_chunks, file_name):
+    logging.info(f"Starting vector store creation for {file_name}.")
     embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    # Create a Chroma vector store from the text chunks and embeddings
-    # The vector store will be persisted to the './chroma_db' directory
-    vector_store = Chroma.from_texts(text_chunks, embedding=embeddings, persist_directory="./chroma_db")
-    # Persist the vector store to disk
+    # Add metadata to each chunk
+    metadatas = [{
+        "source": file_name,
+        "upload_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }] * len(text_chunks)
+
+    vector_store = Chroma.from_texts(text_chunks, embedding=embeddings, metadatas=metadatas, persist_directory="./chroma_db")
     vector_store.persist()
-    logging.info("Vector store created and persisted.")
+    logging.info(f"Vector store created and persisted for {file_name}.")
+
+from datetime import datetime
+
+def get_uploaded_files_from_vectordb():
+    logging.info("Checking Chroma DB for uploaded files.")
+    try:
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+        # Load the persisted Chroma vector store
+        db = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
+        # Retrieve all documents to get their metadata
+        # This might be inefficient for very large dbs, consider a custom Chroma retriever if performance is an issue
+        docs = db.get(include=['metadatas'])
+        if docs and 'metadatas' in docs:
+            # Extract unique filenames from metadata
+            unique_files = sorted(list(set([m['source'] for m in docs['metadatas'] if 'source' in m])))
+            logging.info(f"Found {len(unique_files)} unique files in Chroma DB.")
+            return unique_files
+        else:
+            logging.info("No documents or metadata found in Chroma DB.")
+            return []
+    except Exception as e:
+        logging.error(f"Error accessing Chroma DB: {e}")
+        return []
 
 # Function to set up the conversational chain for Q&A
 def get_conversational_chain():
     logging.info("Setting up conversational chain.")
     # Define the prompt template for the question-answering model
-    prompt_template = """Answer the question as detailed as possible from the provided context, make sure to provide all the details, if the answer is not in
-    provided context, just say, "answer is not available in the context", don't try to make up an answer.
-
-    Context:
-    {context}
-
-    Chat History:
-    {chat_history}
-
-    Question:
-    {question}
-
-    Answer:
-    """
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "Answer the user's questions based on the below context:\n\n{context}"),
+        ("human", "{input}"),
+    ])
 
     # Initialize the ChatGoogleGenerativeAI model
-    model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.3)
-    # Create a PromptTemplate with the defined template and input variables
-    prompt = PromptTemplate(
-        template=prompt_template, input_variables=["context", "question", "chat_history"]
-    )
-    # Load the question-answering chain with the model and prompt
-    chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
+    model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.3, stream=True)
+    # Create a stuff documents chain
+    chain = create_stuff_documents_chain(model, prompt)
     logging.info("Conversational chain set up.")
     return chain
 
@@ -128,34 +152,51 @@ def user_input(user_question, chat_history):
     chain = get_conversational_chain()
 
     # Get the response from the conversational chain
-    response = chain(
-        {"input_documents": docs, "question": user_question, "chat_history": chat_history}, return_only_outputs=True
-    )
-    response_text = response["output_text"]
-    logging.info(f"Response generated: {response_text}")
+    full_response_content = ""
+    for chunk in chain.stream(
+        {"context": docs, "input": user_question}
+    ):
+        content_to_add = ""
+        if hasattr(chunk, 'content'):
+            content_to_add = chunk.content
+        elif isinstance(chunk, dict):
+            if "answer" in chunk:
+                content_to_add = chunk["answer"]
+            elif "page_content" in chunk:
+                content_to_add = chunk["page_content"]
+            elif "content" in chunk:
+                content_to_add = chunk["content"]
+        elif hasattr(chunk, 'page_content'): # For Document objects
+            content_to_add = chunk.page_content
+        else:
+            content_to_add = str(chunk)
+        full_response_content += content_to_add
+        yield content_to_add
+
+    logging.info(f"Full response generated: {full_response_content}")
 
     # Check if the response indicates that the answer is not in the documents
     # This is a heuristic and might need refinement based on model behavior
-    if "I don't know" in response_text or "answer is not available in the context" in response_text or "based on the information provided" in response_text:
-            logging.info("Answer not found in documents, performing web search.")
-            web_search_results = web_search(query=user_question)
-            if web_search_results:
-                # You might want to process these results further or summarize them
-                # For now, just return the first few results as a string
-                search_summary = "\n\nWeb Search Results:\n"
-                for i, result in enumerate(web_search_results[:3]): # Limit to top 3 results
-                    search_summary += f"{i+1}. {result['title']} - {result['link']}\n  {result['snippet']}\n\n"
-                return response_text + search_summary
-            else:
-                return response_text + "\n\nNo relevant web search results found."
-    else:
-        return response_text
+    # if "I don't know" in full_response_content or "answer is not available in the context" in full_response_content or "based on the information provided" in full_response_content:
+    #         logging.info("Answer not found in documents, performing web search.")
+    #         web_search_results = web_search(query=user_question)
+    #          if web_search_results:
+    #             # You might want to process these results further or summarize them
+    #             # For now, just return the first few results as a string
+    #             search_summary = "\n\nWeb Search Results:\n"
+    #             for i, result in enumerate(web_search_results[:3]): # Limit to top 3 results
+    #                 search_summary += f"{i+1}. {result['title']} - {result['link']}\n  {result['snippet']}\n\n"
+    #             yield search_summary
+    #         else:
+    #             yield "\n\nNo relevant web search results found."
+
+
 
 
 def main():
     logging.info("Starting Streamlit application.")
     # Set Streamlit page configuration
-    st.set_page_config(page_title="Gemini RAG Chatbot")
+    st.set_page_config(page_title="Gemini RAG Voicebot")
     # Display the main title of the application
     st.title("Gemini RAG Chatbot")
 
@@ -168,13 +209,87 @@ def main():
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    # Sidebar for API Key input and document processing
+    # Add a section for voice interaction
+    st.subheader("Voice Interaction")
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        record_button = st.button("🎤 Record")
+    with col2:
+        stop_button = st.button("⏹️ Stop")
+
+    if 'recording' not in st.session_state:
+        st.session_state.recording = False
+    if 'audio_recorder' not in st.session_state:
+        st.session_state.audio_recorder = None
+
+    if record_button and not st.session_state.recording:
+        st.session_state.recording = True
+        st.session_state.audio_recorder = AudioToTextRecorder(spinner=False)
+        st.session_state.audio_recorder.start()
+        st.info("Recording... Speak now!")
+
+    if stop_button and st.session_state.recording:
+        st.session_state.recording = False
+        if st.session_state.audio_recorder:
+            st.session_state.audio_recorder.stop()
+            transcribed_text = st.session_state.audio_recorder.text()
+            st.session_state.audio_recorder = None
+            if transcribed_text:
+                st.session_state.messages.append({"role": "user", "content": transcribed_text})
+                with st.chat_message("user"):
+                    st.markdown(transcribed_text)
+                
+                # Generate response from RAG
+                with st.spinner("Thinking..."):
+                    response_container = st.empty()
+                    full_response_content = ""
+                    with st.chat_message("assistant"):
+                        tts_stream = TextToAudioStream(engine=SystemEngine())
+                        for chunk in user_input(transcribed_text, st.session_state.messages):
+                            full_response_content += chunk
+                            response_container.markdown(full_response_content)
+                            try:
+                                tts_stream.feed(chunk)
+                            except Exception as e:
+                                logging.error(f"Error feeding audio chunk: {e}")
+                        try:
+                            tts_stream.play()
+                        except Exception as e:
+                            logging.error(f"Error playing audio stream: {e}")
+                    st.session_state.messages.append({"role": "assistant", "content": full_response_content})
+        else:
+                st.warning("No speech detected.")
+
+    # Handle text input for chat
+    if prompt := st.chat_input("Ask your question here..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.spinner("Thinking..."):
+            response_container = st.empty()
+            full_response_content = ""
+            with st.chat_message("assistant"):
+                tts_stream = TextToAudioStream(engine=SystemEngine())
+                for chunk in user_input(prompt, st.session_state.messages):
+                    full_response_content += chunk
+                    response_container.markdown(full_response_content)
+                    try:
+                        tts_stream.feed(chunk)
+                    except Exception as e:
+                        logging.error(f"Error feeding audio chunk: {e}")
+                try:
+                    tts_stream.play()
+                except Exception as e:
+                    logging.error(f"Error playing audio stream: {e}")
+            st.session_state.messages.append({"role": "assistant", "content": full_response_content})
+
+
     with st.sidebar:
         st.header("Configuration")
         # Input field for Google API Key
         if not GOOGLE_API_KEY:
             google_api_key = st.text_input("Google API Key", type="password", key="google_api_key_input")
-        # Check if API key is provided and set it as an environment variable
             if google_api_key:
                 os.environ["GOOGLE_API_KEY"] = google_api_key
                 st.success("API Key set!")
@@ -183,43 +298,53 @@ def main():
                 st.warning("Please enter your Google API Key!")
                 logging.warning("Google API Key not set.")
 
-        st.subheader("Upload your PDF Documents")
-        # File uploader for PDF documents
-        pdf_docs = st.file_uploader(
-            "Upload your PDF Files and Click on the Process Button",
+        st.subheader("Upload Documents")
+        uploaded_files = st.file_uploader(
+            "Upload your document files (e.g., PDF)",
             accept_multiple_files=True,
+            type=["pdf"]
         )
-        # Button to trigger document processing
-        if st.button("Process Documents"):
-            if pdf_docs:
-                with st.spinner("Processing..."):
-                    # Get raw text from uploaded PDFs
-                    raw_text = get_pdf_text(pdf_docs)
-                    # Get text chunks from the raw text
-                    text_chunks = get_text_chunks(raw_text)
-                    # Create and persist the vector store
-                    get_vector_store(text_chunks)
-                    st.success("Done")
-                    logging.info("Document processing completed successfully.")
+
+        if st.button("Process Uploaded Documents"):
+            if uploaded_files:
+                for uploaded_file in uploaded_files:
+                    with st.spinner(f"Processing {uploaded_file.name}..."):
+                        raw_text = get_document_text(uploaded_file)
+                        if raw_text:
+                            text_chunks = get_text_chunks(raw_text)
+                            get_vector_store(text_chunks, uploaded_file.name)
+                            st.success(f"Processed {uploaded_file.name}")
+                            logging.info(f"Document {uploaded_file.name} processing completed successfully.")
+                st.rerun() # Rerun to update the list of available documents
             else:
-                st.warning("Please upload PDF documents to process.")
-                logging.warning("Process Documents button clicked without PDFs.")
+                st.warning("Please upload documents to process.")
+                logging.warning("Process Uploaded Documents button clicked without files.")
+
+        st.subheader("Available Documents")
+        # Display available documents from Chroma DB
+        available_docs = get_uploaded_files_from_vectordb()
+        if available_docs:
+            for doc_name in available_docs:
+                st.write(f"- {doc_name}")
+        else:
+            st.info("No documents uploaded yet.")
 
     # Main area for user interaction
     # Input field for user's question
-    if prompt := st.chat_input("Ask me anything about the uploaded documents!"):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    # This part is now redundant as the main chat input handles both text and voice
+    # if prompt := st.chat_input("Ask me anything about the uploaded documents!"):
+    #     st.session_state.messages.append({"role": "user", "content": prompt})
+    #     with st.chat_message("user"):
+    #         st.markdown(prompt)
 
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                # Prepare chat history for the model
-                # Exclude the current user prompt from chat history passed to the model
-                chat_history_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in st.session_state.messages[:-1]])
-                response = user_input(prompt, chat_history_str)
-                st.markdown(response)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+    #     with st.chat_message("assistant"):
+    #         with st.spinner("Thinking..."):
+    #             # Prepare chat history for the model
+    #             # Exclude the current user prompt from chat history passed to the model
+    #             chat_history_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in st.session_state.messages[:-1]])
+    #             response = user_input(prompt, chat_history_str)
+    #             st.markdown(response)
+    #     st.session_state.messages.append({"role": "assistant", "content": response})
 
 # Entry point of the application
 if __name__ == "__main__":
